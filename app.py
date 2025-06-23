@@ -1,13 +1,9 @@
 # spectra-analyzer/app.py
-import numpy as _np
-# Monkey-patch NumPy to restore NaN alias for pandas-ta compatibility
-if not hasattr(_np, 'NaN'):
-    _np.NaN = _np.nan
-
 import time
 import psycopg2
 import pandas as pd
-import pandas_ta as ta
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
 from datetime import datetime
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
@@ -20,7 +16,7 @@ DB = {
 }
 SYMBOL_TABLE = 'btc_usdt_ohlcv'
 IND_TABLE    = 'btc_usdt_indicators'
-INTERVAL     = 60  # seconds between analyses
+INTERVAL     = 60  # seconds between each run
 # ────────────────────────────────────────────────────────────────────────────
 
 def wait_for_db():
@@ -36,13 +32,13 @@ def wait_for_db():
 def ensure_table(conn):
     with conn.cursor() as cur:
         cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {IND_TABLE} (
-          timestamp TIMESTAMPTZ PRIMARY KEY,
-          rsi14 DOUBLE PRECISION,
-          macd DOUBLE PRECISION,
-          macd_signal DOUBLE PRECISION,
-          macd_hist DOUBLE PRECISION
-        );
+            CREATE TABLE IF NOT EXISTS {IND_TABLE} (
+              timestamp    TIMESTAMPTZ PRIMARY KEY,
+              rsi14        DOUBLE PRECISION,
+              macd         DOUBLE PRECISION,
+              macd_signal  DOUBLE PRECISION,
+              macd_hist    DOUBLE PRECISION
+            );
         """)
         conn.commit()
 
@@ -52,30 +48,27 @@ def fetch_ohlcv(conn):
     return df
 
 def compute_indicators(df):
-    df = df.copy()
-    df['rsi14'] = ta.rsi(df['close'], length=14)
-    macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-    df = df.join(macd)
-    df.dropna(inplace=True)
-    # Rename columns for clarity
-    df.rename(columns={
-        'MACD_12_26_9': 'macd',
-        'MACDs_12_26_9': 'macd_signal',
-        'MACDh_12_26_9': 'macd_hist'
-    }, inplace=True)
-    return df[['rsi14','macd','macd_signal','macd_hist']]
+    # Compute RSI
+    rsi = RSIIndicator(df['close'], window=14)
+    df['rsi14'] = rsi.rsi()
+    # Compute MACD
+    macd_ind = MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
+    df['macd']        = macd_ind.macd()
+    df['macd_signal'] = macd_ind.macd_signal()
+    df['macd_hist']   = macd_ind.macd_diff()
+    return df.dropna()[['rsi14','macd','macd_signal','macd_hist']]
 
 def upsert_indicators(conn, ind_df):
     with conn.cursor() as cur:
         for ts, row in ind_df.iterrows():
             cur.execute(f"""
-            INSERT INTO {IND_TABLE} (timestamp, rsi14, macd, macd_signal, macd_hist)
-            VALUES (%s,%s,%s,%s,%s)
-            ON CONFLICT (timestamp) DO UPDATE
-              SET rsi14=EXCLUDED.rsi14,
-                  macd=EXCLUDED.macd,
-                  macd_signal=EXCLUDED.macd_signal,
-                  macd_hist=EXCLUDED.macd_hist;
+                INSERT INTO {IND_TABLE}(timestamp,rsi14,macd,macd_signal,macd_hist)
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT (timestamp) DO UPDATE
+                  SET rsi14       = EXCLUDED.rsi14,
+                      macd        = EXCLUDED.macd,
+                      macd_signal = EXCLUDED.macd_signal,
+                      macd_hist   = EXCLUDED.macd_hist;
             """, (ts, row['rsi14'], row['macd'], row['macd_signal'], row['macd_hist']))
         conn.commit()
 
@@ -89,5 +82,5 @@ if __name__ == "__main__":
             upsert_indicators(conn, ind)
             print(f"[{datetime.utcnow()}] Wrote {len(ind)} indicator rows.")
         except Exception as e:
-            print(f"[{datetime.utcnow()}] Error: {e}")
+            print(f"[{datetime.utcnow()}] Error:", e)
         time.sleep(INTERVAL)

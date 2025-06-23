@@ -2,14 +2,12 @@
 FROM python:3.11-slim
 WORKDIR /app
 
-# Copy only requirements to leverage Docker cache
+# Copy & install dependencies
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy analyzer application code
+# Copy analyzer code
 COPY app.py .
 
-# Run the analyzer
+# Run the analyzer on container start
 CMD ["python", "app.py"]
