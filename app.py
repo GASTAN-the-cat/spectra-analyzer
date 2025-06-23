@@ -1,10 +1,16 @@
+# spectra-analyzer/app.py
+import numpy as _np
+# Monkey-patch NumPy to restore NaN alias for pandas-ta compatibility
+if not hasattr(_np, 'NaN'):
+    _np.NaN = _np.nan
+
 import time
 import psycopg2
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# ─── CONFIG ────────────────────────────────────────────────────────────────
 DB = {
     'dbname':   'spectra',
     'user':     'spectra_user',
@@ -15,7 +21,7 @@ DB = {
 SYMBOL_TABLE = 'btc_usdt_ohlcv'
 IND_TABLE    = 'btc_usdt_indicators'
 INTERVAL     = 60  # seconds between analyses
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 
 def wait_for_db():
     while True:
@@ -51,7 +57,13 @@ def compute_indicators(df):
     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
     df = df.join(macd)
     df.dropna(inplace=True)
-    return df[['rsi14','MACD_12_26_9','MACDs_12_26_9','MACDh_12_26_9']]
+    # Rename columns for clarity
+    df.rename(columns={
+        'MACD_12_26_9': 'macd',
+        'MACDs_12_26_9': 'macd_signal',
+        'MACDh_12_26_9': 'macd_hist'
+    }, inplace=True)
+    return df[['rsi14','macd','macd_signal','macd_hist']]
 
 def upsert_indicators(conn, ind_df):
     with conn.cursor() as cur:
@@ -64,7 +76,7 @@ def upsert_indicators(conn, ind_df):
                   macd=EXCLUDED.macd,
                   macd_signal=EXCLUDED.macd_signal,
                   macd_hist=EXCLUDED.macd_hist;
-            """, (ts, row['rsi14'], row['MACD_12_26_9'], row['MACDs_12_26_9'], row['MACDh_12_26_9']))
+            """, (ts, row['rsi14'], row['macd'], row['macd_signal'], row['macd_hist']))
         conn.commit()
 
 if __name__ == "__main__":
@@ -77,5 +89,5 @@ if __name__ == "__main__":
             upsert_indicators(conn, ind)
             print(f"[{datetime.utcnow()}] Wrote {len(ind)} indicator rows.")
         except Exception as e:
-            print(f"[{datetime.utcnow()}] Error:", e)
+            print(f"[{datetime.utcnow()}] Error: {e}")
         time.sleep(INTERVAL)
