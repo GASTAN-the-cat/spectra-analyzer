@@ -1,4 +1,4 @@
-pandas
-pandas-ta
-psycopg2-binary
-numpy<1.26   # pin to the last NumPy versions with numpy.NaN
+numpy==1.25.2
+pandas==2.0.3
+pandas-ta==0.5.118
+psycopg2-binary==2.9.9
