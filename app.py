@@ -1,33 +1,38 @@
 # spectra-analyzer/app.py
+import os
 import time
+import logging
 import psycopg2
 from datetime import datetime
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="[%(asctime)s] %(message)s")
+
 DB = {
-    'dbname':   'spectra',
-    'user':     'spectra_user',
-    'password': 'very_secret_pass',
-    'host':     'timescaledb',
-    'port':     5432
+    'dbname':   os.getenv('DB_NAME', 'spectra'),
+    'user':     os.getenv('DB_USER', 'spectra_user'),
+    'password': os.getenv('DB_PASSWORD', 'very_secret_pass'),
+    'host':     os.getenv('DB_HOST', 'timescaledb'),
+    'port':     int(os.getenv('DB_PORT', 5432)),
 }
-SYMBOL_TABLE = 'btc_usdt_ohlcv'
-IND_TABLE    = 'btc_usdt_indicators'
-RSI_PERIOD   = 14
-MACD_FAST    = 12
-MACD_SLOW    = 26
-MACD_SIGNAL  = 9
-INTERVAL     = 60  # seconds
+SYMBOL_TABLE = os.getenv('SYMBOL_TABLE', 'btc_usdt_ohlcv')
+IND_TABLE    = os.getenv('IND_TABLE', 'btc_usdt_indicators')
+RSI_PERIOD   = int(os.getenv('RSI_PERIOD', 14))
+MACD_FAST    = int(os.getenv('MACD_FAST', 12))
+MACD_SLOW    = int(os.getenv('MACD_SLOW', 26))
+MACD_SIGNAL  = int(os.getenv('MACD_SIGNAL', 9))
+INTERVAL     = int(os.getenv('INTERVAL', 60))  # seconds
 # ────────────────────────────────────────────────────────────────────────────
 
 def wait_for_db():
     while True:
         try:
             conn = psycopg2.connect(**DB)
-            print(f"[{datetime.utcnow()}] Connected to DB")
+            logging.info("Connected to DB")
             return conn
         except psycopg2.OperationalError:
-            print(f"[{datetime.utcnow()}] Waiting for DB…")
+            logging.info("Waiting for DB…")
             time.sleep(5)
 
 def ensure_table(conn):
@@ -58,8 +63,7 @@ def compute_rsi(closes):
         return [None]*len(closes)
     avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
     avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
-    rsi = [None]*(RSI_PERIOD)
-    # first RSI value
+    rsi = [None]*RSI_PERIOD
     rs = avg_gain / avg_loss if avg_loss else float('inf')
     rsi.append(100 - 100/(1+rs))
     for g, l in zip(gains[RSI_PERIOD:], losses[RSI_PERIOD:]):
@@ -67,8 +71,7 @@ def compute_rsi(closes):
         avg_loss = (avg_loss*(RSI_PERIOD-1) + l) / RSI_PERIOD
         rs = avg_gain / avg_loss if avg_loss else float('inf')
         rsi.append(100 - 100/(1+rs))
-    # align length
-    return [None] + rsi  # prepend None for first candle
+    return rsi
 
 def compute_macd(closes):
     def ema(seq, period):
@@ -124,7 +127,7 @@ if __name__ == "__main__":
             macd_list, sig_list, hist_list = compute_macd(list(closes))
             combined = zip(timestamps, rsi_list, macd_list, sig_list, hist_list)
             upsert(conn, combined)
-            print(f"[{datetime.utcnow()}] Wrote indicator rows.")
+            logging.info("Wrote indicator rows.")
         except Exception as e:
-            print(f"[{datetime.utcnow()}] Error: {e}")
+            logging.error(f"Error: {e}")
         time.sleep(INTERVAL)
