@@ -1,3 +1,4 @@
 pandas
 pandas-ta
 psycopg2-binary
+numpy<1.26   # pin to the last NumPy versions with numpy.NaN
