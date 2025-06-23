@@ -1,9 +1,6 @@
 # spectra-analyzer/app.py
 import time
 import psycopg2
-import pandas as pd
-from ta.momentum import RSIIndicator
-from ta.trend import MACD
 from datetime import datetime
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
@@ -16,7 +13,11 @@ DB = {
 }
 SYMBOL_TABLE = 'btc_usdt_ohlcv'
 IND_TABLE    = 'btc_usdt_indicators'
-INTERVAL     = 60  # seconds between each run
+RSI_PERIOD   = 14
+MACD_FAST    = 12
+MACD_SLOW    = 26
+MACD_SIGNAL  = 9
+INTERVAL     = 60  # seconds
 # ────────────────────────────────────────────────────────────────────────────
 
 def wait_for_db():
@@ -26,7 +27,7 @@ def wait_for_db():
             print(f"[{datetime.utcnow()}] Connected to DB")
             return conn
         except psycopg2.OperationalError:
-            print(f"[{datetime.utcnow()}] DB not ready, retrying in 5s…")
+            print(f"[{datetime.utcnow()}] Waiting for DB…")
             time.sleep(5)
 
 def ensure_table(conn):
@@ -42,34 +43,74 @@ def ensure_table(conn):
         """)
         conn.commit()
 
-def fetch_ohlcv(conn):
-    df = pd.read_sql(f"SELECT * FROM {SYMBOL_TABLE} ORDER BY timestamp", conn, parse_dates=['timestamp'])
-    df.set_index('timestamp', inplace=True)
-    return df
-
-def compute_indicators(df):
-    # Compute RSI
-    rsi = RSIIndicator(df['close'], window=14)
-    df['rsi14'] = rsi.rsi()
-    # Compute MACD
-    macd_ind = MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
-    df['macd']        = macd_ind.macd()
-    df['macd_signal'] = macd_ind.macd_signal()
-    df['macd_hist']   = macd_ind.macd_diff()
-    return df.dropna()[['rsi14','macd','macd_signal','macd_hist']]
-
-def upsert_indicators(conn, ind_df):
+def fetch_closes(conn):
     with conn.cursor() as cur:
-        for ts, row in ind_df.iterrows():
+        cur.execute(f"SELECT timestamp, close FROM {SYMBOL_TABLE} ORDER BY timestamp")
+        return cur.fetchall()  # list of (ts, close)
+
+def compute_rsi(closes):
+    gains, losses = [], []
+    for prev, curr in zip(closes, closes[1:]):
+        diff = curr - prev
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    if len(gains) < RSI_PERIOD:
+        return [None]*len(closes)
+    avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
+    avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
+    rsi = [None]*(RSI_PERIOD)
+    # first RSI value
+    rs = avg_gain / avg_loss if avg_loss else float('inf')
+    rsi.append(100 - 100/(1+rs))
+    for g, l in zip(gains[RSI_PERIOD:], losses[RSI_PERIOD:]):
+        avg_gain = (avg_gain*(RSI_PERIOD-1) + g) / RSI_PERIOD
+        avg_loss = (avg_loss*(RSI_PERIOD-1) + l) / RSI_PERIOD
+        rs = avg_gain / avg_loss if avg_loss else float('inf')
+        rsi.append(100 - 100/(1+rs))
+    # align length
+    return [None] + rsi  # prepend None for first candle
+
+def compute_macd(closes):
+    def ema(seq, period):
+        k = 2/(period+1)
+        ema_vals = []
+        ema_vals.append(sum(seq[:period])/period)
+        for price in seq[period:]:
+            ema_vals.append(price*k + ema_vals[-1]*(1-k))
+        return ema_vals
+
+    if len(closes) < MACD_SLOW+MACD_SIGNAL:
+        return [None]*len(closes), [None]*len(closes), [None]*len(closes)
+
+    ema_fast = ema(closes, MACD_FAST)
+    ema_slow = ema(closes, MACD_SLOW)
+    # align: ema_fast starts at index FAST-1, ema_slow at SLOW-1
+    macd_line = [f - s for f, s in zip(ema_fast[MACD_SLOW-MACD_FAST:], ema_slow)]
+    signal_line = ema(macd_line, MACD_SIGNAL)
+    hist = [m - s for m, s in zip(macd_line[MACD_SIGNAL-1:], signal_line)]
+
+    # pad to match original length
+    pad = MACD_SLOW-1 + MACD_SIGNAL-1
+    macd_full   = [None]*pad + macd_line[MACD_SIGNAL-1:]
+    signal_full = [None]*pad + signal_line
+    hist_full   = [None]*pad + hist
+    return macd_full, signal_full, hist_full
+
+def upsert(conn, data):
+    with conn.cursor() as cur:
+        for ts, rsi14, macd, sig, hist in data:
+            if rsi14 is None or macd is None: 
+                continue
             cur.execute(f"""
-                INSERT INTO {IND_TABLE}(timestamp,rsi14,macd,macd_signal,macd_hist)
+                INSERT INTO {IND_TABLE}
+                  (timestamp, rsi14, macd, macd_signal, macd_hist)
                 VALUES (%s,%s,%s,%s,%s)
                 ON CONFLICT (timestamp) DO UPDATE
                   SET rsi14       = EXCLUDED.rsi14,
                       macd        = EXCLUDED.macd,
                       macd_signal = EXCLUDED.macd_signal,
                       macd_hist   = EXCLUDED.macd_hist;
-            """, (ts, row['rsi14'], row['macd'], row['macd_signal'], row['macd_hist']))
+            """, (ts, rsi14, macd, sig, hist))
         conn.commit()
 
 if __name__ == "__main__":
@@ -77,10 +118,13 @@ if __name__ == "__main__":
     ensure_table(conn)
     while True:
         try:
-            df = fetch_ohlcv(conn)
-            ind = compute_indicators(df)
-            upsert_indicators(conn, ind)
-            print(f"[{datetime.utcnow()}] Wrote {len(ind)} indicator rows.")
+            rows = fetch_closes(conn)
+            timestamps, closes = zip(*rows)
+            rsi_list = compute_rsi(list(closes))
+            macd_list, sig_list, hist_list = compute_macd(list(closes))
+            combined = zip(timestamps, rsi_list, macd_list, sig_list, hist_list)
+            upsert(conn, combined)
+            print(f"[{datetime.utcnow()}] Wrote indicator rows.")
         except Exception as e:
-            print(f"[{datetime.utcnow()}] Error:", e)
+            print(f"[{datetime.utcnow()}] Error: {e}")
         time.sleep(INTERVAL)
